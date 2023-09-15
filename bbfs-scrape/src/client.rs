@@ -1,31 +1,31 @@
-use crate::LINK_FILE_EXT;
-use crate::{
-    create_link_file, memberships_data::CourseMemberships, Course, CourseItem, CourseItemContent,
-    User,
-};
-use nix::errno::Errno;
-use pct_str::PctStr;
-use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::num::ParseIntError;
-use std::{collections::HashMap, time::Duration};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use pct_str::PctStr;
 use time::OffsetDateTime;
 use ureq::{Agent, AgentBuilder};
 
+use crate::{
+    create_link_file, memberships_data::CourseMemberships, Course, CourseItem, CourseItemContent,
+    Item, SynthesizedDirectory, User, LINK_FILE_EXT,
+};
+
 const BB_BASE_URL: &str = "https://learn.uq.edu.au";
 
-pub trait BbClient {
-    type Item: Clone;
-    type Error: Into<Errno> + Debug;
+pub trait BbClient: Sync {
+    type Item: Clone + Send + Sync;
 
-    fn get_root(&self) -> Result<Self::Item, Self::Error>;
-    fn get_children(&self, path: Vec<&Self::Item>) -> Result<Vec<Self::Item>, Self::Error>;
-    fn get_size(&self, item: &Self::Item) -> Result<usize, Self::Error>;
-    fn get_contents(&self, item: &Self::Item) -> Result<Vec<u8>, Self::Error>;
+    fn get_root(&self) -> Result<Self::Item, BbError>;
+    fn get_children(&self, path: Vec<&Self::Item>) -> Result<Vec<Self::Item>, BbError>;
+    fn get_size(&self, item: &Self::Item) -> Result<usize, BbError>;
+    fn get_contents(&self, item: &Self::Item) -> Result<Vec<u8>, BbError>;
     fn get_type(&self, item: &Self::Item) -> ItemType;
-    fn get_name(&self, item: &Self::Item) -> Result<String, Self::Error>;
+    fn get_name(&self, item: &Self::Item) -> Result<String, BbError>;
 }
 
 #[derive(PartialEq)]
@@ -62,7 +62,8 @@ pub struct BbApiClient {
     cookies: String,
     agent: Agent,
     all_courses: bool,
-    cache: RefCell<HashMap<CourseItem, Vec<u8>>>,
+    // TODO: Consider a dashmap or similar
+    cache: Mutex<HashMap<CourseItem, Vec<u8>>>,
 }
 
 impl BbApiClient {
@@ -75,7 +76,7 @@ impl BbApiClient {
             cookies,
             agent,
             all_courses,
-            cache: RefCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -148,9 +149,7 @@ impl BbApiClient {
     /// url should be from a CourseItemContent::Folder
     fn get_directory_contents(&self, url: String) -> Result<Vec<CourseItem>, BbError> {
         let html = self.get_page(BbPage::Folder { url })?;
-        Ok(Self::parse_folder_contents(&html)?
-            .into_iter()
-            .collect())
+        Ok(Self::parse_folder_contents(&html)?.into_iter().collect())
     }
 
     fn get_course_item_size(&self, item: &CourseItem) -> Result<usize, BbError> {
@@ -181,7 +180,7 @@ impl BbApiClient {
     }
 
     fn get_course_item_contents(&self, item: &CourseItem) -> Result<Vec<u8>, BbError> {
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.lock().unwrap();
         if cache.contains_key(item) {
             return Ok(cache[item].clone());
         }
@@ -199,12 +198,7 @@ impl BbApiClient {
                     response
                         .into_reader()
                         .read_to_end(&mut bytes)
-                        .map_err(|e| {
-                            BbError::FailedToGetContents(
-                                item.clone(),
-                                e.raw_os_error().map(Errno::from_i32),
-                            )
-                        })?;
+                        .map_err(|e| BbError::FailedToGetContents(item.clone(), Some(e)))?;
                     bytes
                 }
                 //CourseItemContent::FolderUrl(_) => unreachable!(),
@@ -221,31 +215,11 @@ impl BbApiClient {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct SynthesizedFile {
-    name: String,
-    contents: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct SynthesizedDirectory {
-    name: String,
-    contents: Vec<Item>,
-}
-
-#[derive(Clone, Debug)]
-pub enum Item {
-    Course(Course),
-    CourseItem(CourseItem),
-    SynthesizedFile(SynthesizedFile),
-    SynthesizedDirectory(SynthesizedDirectory),
-}
-
 #[derive(Debug)]
 pub enum BbError {
     FailedToGetPage(BbPage, Box<ureq::Error>),
     FailedToReadPageContents(BbPage, std::io::Error),
-    FailedToGetContents(CourseItem, Option<Errno>),
+    FailedToGetContents(CourseItem, Option<std::io::Error>),
     FailedToGetHeaders(Box<ureq::Error>),
     MissingContentLengthHeader,
     InvalidContentLengthHeader(ParseIntError),
@@ -255,21 +229,42 @@ pub enum BbError {
     NotAFile(Item),
 }
 
-impl From<BbError> for Errno {
-    fn from(val: BbError) -> Self {
-        eprintln!("{:?}", val);
+#[cfg(unix)]
+impl From<BbError> for nix::errno::Errno {
+    fn from(error: BbError) -> nix::errno::Errno {
+        eprintln!("{:?}", error);
         // TODO: Choose errnos more carefully
-        match val {
+        match error {
             BbError::FailedToGetPage(_, _)
             | BbError::FailedToGetContents(_, _)
-            | BbError::FailedToGetHeaders(_) => Errno::ENETRESET,
+            | BbError::FailedToGetHeaders(_) => nix::errno::Errno::ENETRESET,
             BbError::FailedToReadPageContents(_, _)
             | BbError::MissingContentLengthHeader
             | BbError::InvalidContentLengthHeader(_)
             | BbError::FailedToWebScrapeFolder(_)
             | BbError::FailedToParseMemberships(_)
-            | BbError::FailedToParseMe(_)
-            | BbError::NotAFile(_) => Errno::EIO,
+            | BbError::FailedToParseMe(_) => nix::errno::Errno::EIO,
+            BbError::NotAFile(_) => nix::errno::Errno::EISDIR,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<BbError> for winapi::shared::ntdef::NTSTATUS {
+    fn from(error: BbError) -> winapi::shared::ntdef::NTSTATUS {
+        use winapi::shared::ntstatus;
+        eprintln!("{:?}", error);
+        match error {
+            BbError::FailedToGetPage(_, _)
+            | BbError::FailedToGetContents(_, _)
+            | BbError::FailedToGetHeaders(_) => ntstatus::STATUS_UNEXPECTED_NETWORK_ERROR,
+            BbError::FailedToReadPageContents(_, _)
+            | BbError::MissingContentLengthHeader
+            | BbError::InvalidContentLengthHeader(_)
+            | BbError::FailedToWebScrapeFolder(_)
+            | BbError::FailedToParseMemberships(_)
+            | BbError::FailedToParseMe(_) => ntstatus::STATUS_FILE_NOT_AVAILABLE,
+            BbError::NotAFile(_) => ntstatus::STATUS_FILE_IS_A_DIRECTORY,
         }
     }
 }
@@ -285,9 +280,8 @@ impl Error for BbError {}
 
 impl BbClient for BbApiClient {
     type Item = Item;
-    type Error = BbError;
 
-    fn get_root(&self) -> Result<Self::Item, Self::Error> {
+    fn get_root(&self) -> Result<Self::Item, BbError> {
         Ok(Item::SynthesizedDirectory(SynthesizedDirectory {
             name: "root".into(),
             contents: self.get_courses()?.into_iter().map(Item::Course).collect(),
@@ -310,20 +304,14 @@ impl BbClient for BbApiClient {
                         .map(Item::CourseItem)
                         .collect();
 
-                    items.push(Item::SynthesizedFile(SynthesizedFile {
-                        name: format!("Blackboard.{}", LINK_FILE_EXT),
-                        contents: create_link_file(&link),
-                    }));
+                    items.push(Item::make_link_file("Blackboard", &link));
 
                     Ok(items)
                 }
                 Item::CourseItem(course_item) => {
                     let mut items: Vec<Item> = match &course_item.content {
                         Some(CourseItemContent::Link(link)) => {
-                            vec![Item::SynthesizedFile(SynthesizedFile {
-                                name: format!("{}.{}", course_item.name, LINK_FILE_EXT),
-                                contents: create_link_file(link),
-                            })]
+                            vec![Item::make_link_file(&course_item.name, link)]
                         }
                         Some(CourseItemContent::FileUrl(url)) => {
                             vec![Item::CourseItem(CourseItem {
@@ -338,71 +326,18 @@ impl BbClient for BbApiClient {
                             .into_iter()
                             .map(Item::CourseItem)
                             .collect(),
-                        // TODO: attachments
                         None => vec![],
                     };
 
-                    if !course_item.attachments.is_empty() {
-                        items.append(
-                            &mut course_item
-                                .attachments
-                                .iter()
-                                .map(|attachment| {
-                                    Item::CourseItem(CourseItem {
-                                        name: "".into(),
-                                        content: Some(CourseItemContent::FileUrl(
-                                            attachment.clone(),
-                                        )),
-                                        description: None,
-                                        attachments: vec![],
-                                    })
-                                })
-                                .collect(),
-                        );
-                    }
+                    items.append(&mut course_item.attachments_as_items());
 
-                    if let Some(description) = &course_item.description {
-                        items.push(Item::SynthesizedFile(SynthesizedFile {
-                            name: format!("{}.txt", course_item.name),
-                            contents: description.clone(),
-                        }));
-                    }
+                    items.extend(course_item.maybe_new_description_file());
 
-                    if let Some(CourseItemContent::Link(link)) = &course_item.content {
-                        if !course_item.attachments.is_empty() {
-                            items.push(Item::SynthesizedFile(SynthesizedFile {
-                                name: format!("{}.{}", course_item.name, LINK_FILE_EXT),
-                                contents: create_link_file(link),
-                            }));
-                        }
-                    }
+                    items.extend(course_item.maybe_new_link_file());
 
-                    let link = match &course_item.content {
-                        Some(CourseItemContent::FolderUrl(url)) => url.clone(),
-                        Some(CourseItemContent::Link(_) | CourseItemContent::FileUrl(_)) | None => {
-                            // Get a link to the parent
-                            match path[path.len() - 2] {
-                                Item::Course(course) => format!(
-                                    "https://learn.uq.edu.au/ultra/courses/{}/cl/outline",
-                                    course.id
-                                ),
-                                Item::CourseItem(item) => match &item.content {
-                                    Some(CourseItemContent::FolderUrl(url)) => url.clone(),
-                                    Some(CourseItemContent::FileUrl(_))
-                                    | Some(CourseItemContent::Link(_))
-                                    | None => unreachable!(),
-                                },
-                                Item::SynthesizedDirectory(_) | Item::SynthesizedFile(_) => {
-                                    unreachable!()
-                                }
-                            }
-                        }
-                    };
+                    let link = course_item.get_blackboard_link(path[path.len() - 2]);
 
-                    items.push(Item::SynthesizedFile(SynthesizedFile {
-                        name: format!("Blackboard.{}", LINK_FILE_EXT),
-                        contents: create_link_file(&link),
-                    }));
+                    items.push(Item::make_link_file("Blackboard", &link));
 
                     Ok(items)
                 }
